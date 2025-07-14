@@ -16,16 +16,13 @@ from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, H
 #from langchain.embeddings import HuggingFaceEmbeddings
 from langchain_core.callbacks import StdOutCallbackHandler
 from langchain_aws import BedrockLLM  # Use the updated Bedrock LLM wrapper
+from config import DB_NAME, OPENAI_MODEL_ID, BEDROCK_MODEL_ID, BEDROCK_REGION, BEDROCK_MODEL_KWARGS
 
-def initialize_constants():
-    """Initialize constants and load environment variables."""
-    print("****Initializing model and db_name")
-    global MODEL, db_name, LLM_PROVIDER
-    MODEL = "gpt-4o-mini"
-    db_name = "rag_electric/vector_db"
+def initialize():
+    """Load environment variables."""
+    print("****Initializing... ")
     load_dotenv(override=True)
     os.environ['OPENAI_API_KEY'] = os.getenv('OPENAI_API_KEY', 'your-key-if-not-using-env')
-    LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'openai')
 
 
 def add_metadata(doc, doc_type):
@@ -85,17 +82,15 @@ def create_knowledge_base():
 def create_vectorstore(chunks=None, load_only=False):
     """Create or load the vector store using embeddings."""
     print("****Creating or loading the vector store")
-    
     embeddings = OpenAIEmbeddings()
-
-    if os.path.exists(db_name):
-        print(f"Vectorstore found at {db_name}, loading existing vectorstore...")
-        vectorstore = Chroma(persist_directory=db_name, embedding_function=embeddings)
+    if os.path.exists(DB_NAME):
+        print(f"Vectorstore found at {DB_NAME}, loading existing vectorstore...")
+        vectorstore = Chroma(persist_directory=DB_NAME, embedding_function=embeddings)
     else:
         if load_only:
-            raise FileNotFoundError(f"Vectorstore not found at {db_name} and load_only=True.")
-        print(f"Vectorstore not found at {db_name}, creating new vectorstore...")
-        vectorstore = Chroma.from_documents(documents=chunks, embedding=embeddings, persist_directory=db_name)
+            raise FileNotFoundError(f"Vectorstore not found at {DB_NAME} and load_only=True.")
+        print(f"Vectorstore not found at {DB_NAME}, creating new vectorstore...")
+        vectorstore = Chroma.from_documents(documents=chunks, embedding=embeddings, persist_directory=DB_NAME)
         print(f"Vectorstore created with {vectorstore._collection.count()} documents")
         collection = vectorstore._collection
         count = collection.count()
@@ -105,28 +100,24 @@ def create_vectorstore(chunks=None, load_only=False):
     return vectorstore
 
 
-def create_conversation_chain(vectorstore):
+def create_conversation_chain(vectorstore, llm_provider):
     """Create a conversation chain using the vectorstore with a system prompt."""
-    print("****Creating a conversation chain using the vectorstore")
-    if LLM_PROVIDER == "openai":
-        llm = ChatOpenAI(temperature=0.7, model_name=MODEL)
-    elif LLM_PROVIDER == "bedrock":
-        # Use BedrockLLM from langchain_aws, pass temperature via model_kwargs
+    print(f"****Creating a conversation chain using the vectorstore and provider: {llm_provider}")
+    if llm_provider == "openai-gpt-4o-mini":
+        llm = ChatOpenAI(temperature=0.7, model_name=OPENAI_MODEL_ID)
+    elif llm_provider == "aws_br_mistral_small":
         llm = BedrockLLM(
-            model_id="mistral.mistral-small-2402-v1:0",
-            region_name="us-east-1",
-            model_kwargs={"temperature": 0.7},
+            model_id=BEDROCK_MODEL_ID,
+            region_name=BEDROCK_REGION,
+            model_kwargs=BEDROCK_MODEL_KWARGS,
         )
     else:
-        raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER}")
+        raise ValueError(f"Unknown LLM_PROVIDER: {llm_provider}")
 
     memory = ConversationBufferMemory(memory_key='chat_history', return_messages=True)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 25})
 
-    # Define the system prompt
     system_prompt = EE_SYSTEM_PROMPT
-
-    # Create a chat prompt template with system and human messages
     prompt = ChatPromptTemplate.from_messages([
         SystemMessagePromptTemplate.from_template(system_prompt),
         HumanMessagePromptTemplate.from_template("{question}\n\nContext:\n{context}")
@@ -141,32 +132,63 @@ def create_conversation_chain(vectorstore):
     )
     return conversation_chain
 
-def make_chat(conversation_chain):
-    """"Gradio accepts only fn signature with question and history
-        This is a wrapper function"""
-    
-    def chat(question, history):
+
+def make_chat(vectorstore):
+    """Gradio accepts only fn signature with question, history, and model provider."""
+    def chat(question, history, llm_provider):
+        conversation_chain = create_conversation_chain(vectorstore, llm_provider)
         result = conversation_chain.invoke({"question": question})
         return result["answer"]
-    
     return chat
 
 
 def main():
     print("Hello from rag-electric!")
-    initialize_constants()
-    if os.path.exists(db_name):
-        print(f"Vectorstore already exists at {db_name}. Skipping knowledge base creation and using existing vectorstore.")
+    initialize()
+
+    if os.path.exists(DB_NAME):
+        print(f"Vectorstore already exists at {DB_NAME}. Skipping knowledge base creation and using existing vectorstore.")
         vectorstore = create_vectorstore(load_only=True)
     else:
         chunks = create_knowledge_base()
         vectorstore = create_vectorstore(chunks)
-    
-    conversation_chain = create_conversation_chain(vectorstore)
-    
-    print("****Launching Gradio UI chat")
-    chat_fn = make_chat(conversation_chain)
-    view = gr.ChatInterface(chat_fn, type="messages", title="RAG Electrical Projects").launch(inbrowser=True)
+
+    chat_fn = make_chat(vectorstore)
+
+    with gr.Blocks() as demo:
+        gr.Markdown("# RAG Electrical Projects")
+        with gr.Row():
+            model_selector = gr.Dropdown(
+                choices=["openai-gpt-4o-mini", "aws_br_mistral_small"],
+                value="openai-gpt-4o-mini",
+                label="Select LLM Provider"
+            )
+        chatbot = gr.Chatbot()
+        with gr.Row():
+            user_input = gr.Textbox(label="Your question", scale=4)
+            send_btn = gr.Button("Send", scale=1)
+        state = gr.State([])  # To keep chat history
+
+        def respond(message, history, llm_provider):
+            # Defensive: ensure history is a list of [user, bot] pairs
+            if not isinstance(history, list):
+                history = []
+            answer = chat_fn(message, history, llm_provider)
+            history = history + [[message, answer]]
+            return history, history
+
+        send_btn.click(
+            respond,
+            inputs=[user_input, state, model_selector],
+            outputs=[chatbot, state]
+        )
+        user_input.submit(
+            respond,
+            inputs=[user_input, state, model_selector],
+            outputs=[chatbot, state]
+        )
+
+    demo.launch(inbrowser=True)
 
 
 if __name__ == "__main__":
