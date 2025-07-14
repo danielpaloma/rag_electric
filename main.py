@@ -1,3 +1,4 @@
+#Implementing AWS Bedrock
 import os
 import glob
 from dotenv import load_dotenv
@@ -14,15 +15,17 @@ from langchain.chains import ConversationalRetrievalChain
 from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 #from langchain.embeddings import HuggingFaceEmbeddings
 from langchain_core.callbacks import StdOutCallbackHandler
+from langchain_aws import BedrockLLM  # Use the updated Bedrock LLM wrapper
 
 def initialize_constants():
     """Initialize constants and load environment variables."""
     print("****Initializing model and db_name")
-    global MODEL, db_name
+    global MODEL, db_name, LLM_PROVIDER
     MODEL = "gpt-4o-mini"
     db_name = "rag_electric/vector_db"
     load_dotenv(override=True)
     os.environ['OPENAI_API_KEY'] = os.getenv('OPENAI_API_KEY', 'your-key-if-not-using-env')
+    LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'openai')
 
 
 def add_metadata(doc, doc_type):
@@ -39,7 +42,7 @@ def create_knowledge_base():
     folders = [os.path.join(base_folder, f) for f in os.listdir(base_folder) if os.path.isdir(os.path.join(base_folder, f))]
 
     text_loader_kwargs = {'encoding': 'utf-8'}
-    # If that doesn't work (Windows users) --> uncomment the next line instead
+    # If any Windows issue --> uncomment the next line instead
     # text_loader_kwargs={'autodetect_encoding': True}
 
     documents = []
@@ -82,7 +85,9 @@ def create_knowledge_base():
 def create_vectorstore(chunks=None, load_only=False):
     """Create or load the vector store using embeddings."""
     print("****Creating or loading the vector store")
+    
     embeddings = OpenAIEmbeddings()
+
     if os.path.exists(db_name):
         print(f"Vectorstore found at {db_name}, loading existing vectorstore...")
         vectorstore = Chroma(persist_directory=db_name, embedding_function=embeddings)
@@ -103,7 +108,18 @@ def create_vectorstore(chunks=None, load_only=False):
 def create_conversation_chain(vectorstore):
     """Create a conversation chain using the vectorstore with a system prompt."""
     print("****Creating a conversation chain using the vectorstore")
-    llm = ChatOpenAI(temperature=0.7, model_name=MODEL)
+    if LLM_PROVIDER == "openai":
+        llm = ChatOpenAI(temperature=0.7, model_name=MODEL)
+    elif LLM_PROVIDER == "bedrock":
+        # Use BedrockLLM from langchain_aws, pass temperature via model_kwargs
+        llm = BedrockLLM(
+            model_id="mistral.mistral-small-2402-v1:0",
+            region_name="us-east-1",
+            model_kwargs={"temperature": 0.7},
+        )
+    else:
+        raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER}")
+
     memory = ConversationBufferMemory(memory_key='chat_history', return_messages=True)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 25})
 
